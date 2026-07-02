@@ -35,8 +35,25 @@ function moveTo(coord: Coord, move: Move): Coord {
   }
 }
 
+// Array.sort is stable, so without this, tied scores would always resolve
+// to the same ALL_MOVES order (e.g. always "up") - a pattern an opponent
+// could learn. Shuffling first makes ties resolve randomly instead.
+function shuffled<T>(items: T[]): T[] {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
+  }
+  return result;
+}
+
 function coordKey(coord: Coord): string {
   return `${coord.x},${coord.y}`;
+}
+
+function parseCoordKey(key: string): Coord {
+  const [x, y] = key.split(",").map(Number);
+  return { x, y };
 }
 
 function isOutOfBounds(coord: Coord, gameState: GameState): boolean {
@@ -117,6 +134,63 @@ function floodFillSize(
   return count;
 }
 
+// Plain flood-fill only tells us whether space is reachable, not whether an
+// enemy would get there first and cut us off. This races every snake's head
+// outward simultaneously (multi-source BFS) and counts cells we'd reach
+// strictly before any enemy - our actual contested territory, not just
+// theoretically empty space.
+function computeControlledSpace(
+  candidateHead: Coord,
+  gameState: GameState,
+  occupied: Set<string>
+): number {
+  const owner = new Map<string, string>();
+  let frontier: Array<{ key: string; owner: string }> = [];
+
+  const youKey = coordKey(candidateHead);
+  owner.set(youKey, "you");
+  frontier.push({ key: youKey, owner: "you" });
+
+  for (const snake of gameState.board.snakes) {
+    if (snake.id === gameState.you.id) continue;
+    const key = coordKey(snake.head);
+    if (owner.has(key)) continue;
+    owner.set(key, snake.id);
+    frontier.push({ key, owner: snake.id });
+  }
+
+  while (frontier.length > 0) {
+    const claims = new Map<string, Set<string>>();
+    for (const { key, owner: ownerId } of frontier) {
+      for (const dir of ALL_MOVES) {
+        const next = moveTo(parseCoordKey(key), dir);
+        const nextKey = coordKey(next);
+        if (owner.has(nextKey) || isOutOfBounds(next, gameState) || occupied.has(nextKey)) {
+          continue;
+        }
+        if (!claims.has(nextKey)) claims.set(nextKey, new Set());
+        claims.get(nextKey)!.add(ownerId);
+      }
+    }
+
+    frontier = [];
+    for (const [key, owners] of claims) {
+      // Two snakes reaching a cell in the same number of moves means neither
+      // gets there uncontested - leave it unclaimed rather than guess.
+      if (owners.size !== 1) continue;
+      const ownerId = [...owners][0];
+      owner.set(key, ownerId);
+      frontier.push({ key, owner: ownerId });
+    }
+  }
+
+  let count = 0;
+  for (const ownerId of owner.values()) {
+    if (ownerId === "you") count++;
+  }
+  return count;
+}
+
 function distanceToNearestFood(coord: Coord, gameState: GameState): number {
   if (gameState.board.food.length === 0) return Infinity;
   return Math.min(
@@ -170,18 +244,20 @@ export function move(gameState: GameState): { move: Move } {
   if (nonHazard.length > 0) candidates = nonHazard;
 
   const boardSize = gameState.board.width * gameState.board.height;
-  const scored = candidates.map((candidate) => {
+  const scored = shuffled(candidates).map((candidate) => {
     const next = moveTo(gameState.you.head, candidate);
     return {
       move: candidate,
       space: floodFillSize(next, gameState, occupied, boardSize),
+      controlledSpace: computeControlledSpace(next, gameState, occupied),
       foodDistance: distanceToNearestFood(next, gameState),
       enemyDistance: distanceToNearestSmallerEnemy(next, gameState),
     };
   });
 
   // Discard moves that trap us in a space smaller than our own body, if a
-  // roomier option exists.
+  // roomier option exists. This is about raw reachable space (a dead end is
+  // fatal even if uncontested), unlike the controlled-space score below.
   const roomy = scored.filter((s) => s.space >= gameState.you.length);
   const options = roomy.length > 0 ? roomy : scored;
 
@@ -193,7 +269,7 @@ export function move(gameState: GameState): { move: Move } {
     if (lowHealth && a.foodDistance !== b.foodDistance) {
       return a.foodDistance - b.foodDistance;
     }
-    if (b.space !== a.space) return b.space - a.space;
+    if (b.controlledSpace !== a.controlledSpace) return b.controlledSpace - a.controlledSpace;
     if (aggroActive && a.enemyDistance !== b.enemyDistance) {
       return a.enemyDistance - b.enemyDistance;
     }
