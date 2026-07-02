@@ -255,6 +255,22 @@ function buildHazardCells(gameState: GameState): Set<string> {
   return new Set(gameState.board.hazards.map(coordKey));
 }
 
+// In Royale, the hazard zone keeps expanding until only a small safe area is
+// left - if every move from here is through hazard anyway, the priority
+// shifts from food/territory to getting back onto safe ground as fast as
+// possible, since sitting in hazard drains health well beyond normal upkeep.
+function distanceToNearestSafeCell(coord: Coord, gameState: GameState, hazards: Set<string>): number {
+  let nearest = Infinity;
+  for (let x = 0; x < gameState.board.width; x++) {
+    for (let y = 0; y < gameState.board.height; y++) {
+      if (hazards.has(coordKey({ x, y }))) continue;
+      const distance = Math.abs(x - coord.x) + Math.abs(y - coord.y);
+      if (distance < nearest) nearest = distance;
+    }
+  }
+  return nearest;
+}
+
 // Chasing a strictly smaller snake threatens a head-to-head we'd win, which
 // can force it into a mistake or a kill - but only worth it nearby, so it
 // doesn't pull us away from food or safety for a snake across the board.
@@ -308,6 +324,7 @@ export function move(gameState: GameState): { move: Move } {
   const nonHazard = candidates.filter(
     (candidate) => !hazards.has(coordKey(moveTo(gameState.you.head, candidate)))
   );
+  const forcedIntoHazard = hazards.size > 0 && nonHazard.length === 0;
   if (nonHazard.length > 0) candidates = nonHazard;
 
   const scored = shuffled(candidates).map((candidate) => {
@@ -318,6 +335,7 @@ export function move(gameState: GameState): { move: Move } {
       controlledSpace: computeControlledSpace(next, gameState, occupied),
       foodDistance: distanceToNearestFood(next, gameState),
       enemyDistance: distanceToNearestSmallerEnemy(next, gameState),
+      safeCellDistance: forcedIntoHazard ? distanceToNearestSafeCell(next, gameState, hazards) : 0,
     };
   });
 
@@ -332,6 +350,9 @@ export function move(gameState: GameState): { move: Move } {
     !lowHealth && distanceToNearestSmallerEnemy(gameState.you.head, gameState) <= AGGRO_RANGE;
 
   options.sort((a, b) => {
+    if (forcedIntoHazard && a.safeCellDistance !== b.safeCellDistance) {
+      return a.safeCellDistance - b.safeCellDistance;
+    }
     if (lowHealth && a.foodDistance !== b.foodDistance) {
       return a.foodDistance - b.foodDistance;
     }
