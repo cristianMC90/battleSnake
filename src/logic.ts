@@ -3,6 +3,7 @@ import { Coord, GameState, Move } from "./types";
 const ALL_MOVES: Move[] = ["up", "down", "left", "right"];
 const LOW_HEALTH_THRESHOLD = 50;
 const AGGRO_RANGE = 6;
+const THREAT_LOOKAHEAD_RANGE = 4;
 
 export function info() {
   return {
@@ -134,6 +135,58 @@ function floodFillSize(
   return count;
 }
 
+// The nearest equal-or-larger enemy is the one worth simulating a move ahead
+// for - anything farther away can't reach us in time to matter for this turn.
+function findNearestThreat(gameState: GameState): Coord & { length: number } | null {
+  let nearest: (Coord & { length: number }) | null = null;
+  let nearestDistance = Infinity;
+
+  for (const snake of gameState.board.snakes) {
+    if (snake.id === gameState.you.id) continue;
+    if (snake.length < gameState.you.length) continue;
+
+    const distance = Math.abs(snake.head.x - gameState.you.head.x) + Math.abs(snake.head.y - gameState.you.head.y);
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearest = { ...snake.head, length: snake.length };
+    }
+  }
+
+  return nearestDistance <= THREAT_LOOKAHEAD_RANGE ? nearest : null;
+}
+
+// A move can look safe this turn yet still walk us into a corner: the threat
+// takes its own best shot next turn, and only then do we find out how much
+// room is left. This simulates every move the threat could make and keeps
+// the worst resulting space - a losing head-to-head counts as zero room.
+function worstCaseSpaceAfterThreat(
+  ourNextHead: Coord,
+  threat: Coord,
+  gameState: GameState,
+  occupied: Set<string>,
+  boardSize: number
+): number {
+  const threatMoves = ALL_MOVES.map((dir) => moveTo(threat, dir)).filter(
+    (pos) => !isOutOfBounds(pos, gameState) && !occupied.has(coordKey(pos))
+  );
+
+  if (threatMoves.length === 0) {
+    return floodFillSize(ourNextHead, gameState, occupied, boardSize);
+  }
+
+  let worst = Infinity;
+  for (const threatNext of threatMoves) {
+    if (coordKey(threatNext) === coordKey(ourNextHead)) {
+      worst = 0;
+      continue;
+    }
+    const occupiedAfterThreatMove = new Set(occupied);
+    occupiedAfterThreatMove.add(coordKey(threatNext));
+    worst = Math.min(worst, floodFillSize(ourNextHead, gameState, occupiedAfterThreatMove, boardSize));
+  }
+  return worst;
+}
+
 // Plain flood-fill only tells us whether space is reachable, not whether an
 // enemy would get there first and cut us off. This races every snake's head
 // outward simultaneously (multi-source BFS) and counts cells we'd reach
@@ -236,6 +289,20 @@ export function move(gameState: GameState): { move: Move } {
   );
   if (nonRisky.length > 0) candidates = nonRisky;
 
+  const boardSize = gameState.board.width * gameState.board.height;
+  const threat = findNearestThreat(gameState);
+
+  // Look one move past the threat's response: a move that survives this
+  // turn but leaves no real room once it reacts is still a trap, so avoid
+  // it while a more robust option exists.
+  if (threat) {
+    const survivesThreatResponse = candidates.filter((candidate) => {
+      const next = moveTo(gameState.you.head, candidate);
+      return worstCaseSpaceAfterThreat(next, threat, gameState, occupied, boardSize) >= gameState.you.length;
+    });
+    if (survivesThreatResponse.length > 0) candidates = survivesThreatResponse;
+  }
+
   // Hazard cells cost extra health rather than killing outright, so avoid them
   // only when a non-hazardous option is still available.
   const nonHazard = candidates.filter(
@@ -243,7 +310,6 @@ export function move(gameState: GameState): { move: Move } {
   );
   if (nonHazard.length > 0) candidates = nonHazard;
 
-  const boardSize = gameState.board.width * gameState.board.height;
   const scored = shuffled(candidates).map((candidate) => {
     const next = moveTo(gameState.you.head, candidate);
     return {
